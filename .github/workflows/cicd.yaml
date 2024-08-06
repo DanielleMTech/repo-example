@@ -1,0 +1,179 @@
+# see diagram here to understand:
+# https://trustmineral.atlassian.net/wiki/spaces/DEVOP/pages/3018391870/Mineral+Updated+CICD
+name: Build and Deploy w/ Argocd
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'develop'
+      - 'qa'
+      - 'main'
+env:
+  ECR_REGISTRY: 743115313691.dkr.ecr.us-west-2.amazonaws.com
+  ECR_REPOSITORY: trustmineral/${{ github.event.repository.name }}
+  
+jobs:
+  build:
+    name: Docker Service Build/Push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 5
+        ## Git Sha used in docker image Tag and "/version" endpoint
+      - name: Set short git commit SHA
+        id: vars
+        run: |
+          calculatedSha=${GITHUB_SHA::7}
+          echo "COMMIT_SHORT_SHA=$calculatedSha" >> $GITHUB_ENV
+          tmp_branch_name=$(echo ${{ github.ref_name }} | sed 's/\//-/g')
+          echo "BRANCH_NAME=$tmp_branch_name" >> $GITHUB_ENV
+          echo "TAG_NAME=$tmp_branch_name-$calculatedSha" >> $GITHUB_ENV
+      - name: Confirm git commit SHA output
+        run: echo ${{ env.TAG_NAME }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ECR_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_ECR_SECRET_KEY }}
+          aws-region: us-west-2
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+        ## Necessary for using the github cache to speed up builds
+      - name: Expose GitHub Runtime
+        uses: crazy-max/ghaction-github-runtime@v3
+        ## Builds both the code image but also an image to use for migration automation
+      - name: Run Docker build and push
+        id: "buildimage"
+        env:
+          IMAGE_TAG: ${{ env.TAG_NAME }}
+        run: |
+          ## Build a docker container and push it to ECR
+          aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin $ECR_REGISTRY
+          docker buildx build --push --build-arg IMAGE_TAG=$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+     
+  release:
+    name: Argocd Sync and Confirm
+    needs: build
+    ## Note this run on an internal Mineral-owned k8's machine in the SVC cluster
+     # the SVC cluster is in the prod account and also runs argocd. Using the internal 
+     # machine is necessary since argo should be network segmented for security. 
+    runs-on: internal-runner
+    steps:
+        ## This mapping is used to map branches to environments.
+         # Change if you ever need a custom cicd branch => env mapping
+      - name: Export variables corresponding to branch
+        uses: kanga333/variable-mapper@master
+        with:
+          key: "${{github.ref_name}}"
+          ## will loop through any list however, prod will be special since it doesnt
+           # autosync so the instant version check wont work "prod" should also be
+           # last as to test the changes in the lower environments first,
+           #  the system is so opinionated about this that it will exit 0 instead of doing
+           # continue so that it exits prematurely before making changes to prod that havent 
+           # gone to a lower environment first
+          map: |
+            {
+              "develop": {
+                "environments": "dev"
+              },
+              "qa": {
+                "environments": "qa preprod"
+              },
+              "main": {
+                "environments": "alpha prod"
+              },                   
+              ".*": {
+                "environments": ""
+              }
+            }
+      - name: Echo environment
+        run: echo ${{ env.environments }}
+      - name: Checkout Code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 5
+        ## Unfortunately outputs between jobs on differnt hosts dont seem to work
+         # so the sha is calculated twice instead of passed from build stage. This is 
+         # a good > perfect kind of scenario
+      - name: Set short git commit SHA
+        id: git
+        run: |
+          calculatedSha=${GITHUB_SHA::7}
+          echo "COMMIT_SHORT_SHA=$calculatedSha" >> $GITHUB_ENV
+          tmp_branch_name=$(echo ${{ github.ref_name }} | sed 's/\//-/g')
+          echo "BRANCH_NAME=$tmp_branch_name" >> $GITHUB_ENV
+          echo "TAG_NAME=$tmp_branch_name-$calculatedSha" >> $GITHUB_ENV     
+          
+      - name: Confirm git commit SHA output
+        run: echo ${{ env.TAG_NAME }}
+        ## Login to argo using token, the token is in 1password as well 
+         # under "argo image updater"
+         
+      - name: Argocd Setup
+        uses: clowdhaus/argo-cd-action/@main
+        env:
+          ARGOCD_SERVER: argocd.trustmineral.com
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          
+        ## Below is where all the magic happens:
+         # the image build in the last step is in ECR with the TAG_NAME
+         # this step now sets the app to use that image 
+         # that will make the app "out of sync"
+         # in non-prod environments the app will auto-sync
+         # syncing will run flyway/migrations using whatever is in the sql/ directory
+         # prior to rolling out the image. after the flyway is run the image rolls out with a new
+         # uniqe tag, which means a rollback to the prior version is also possible.
+         # the script below will confirm argo sync success before marking the Github acction a succes.
+         # just as an extra measure, the system will then confirm the /version endpoint returns that tag 
+         # that started the whole process, for environments that dont autosync (production), this wont happen.
+         # and will likely be left to an external production script
+         ## Note that since pods can take time to start up we want to wait all the way for "health" status to be apparent,
+          # waits a maximums of 15 minutes (for long running migrations this may need to modified)
+      - name: Argocd Sync and Confirm
+        env:
+          ARGOCD_SERVER: argocd.trustmineral.com
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}  
+          REPONAME: ${{ github.event.repository.name }}
+          IMAGE_TAG: ${{ env.TAG_NAME }}
+        id: vars
+        run: |
+          set -ex
+          for env in ${{ env.environments }}; do
+            argocd account get-user-info
+            argo_appname="${env}-${{ env.REPONAME }}"
+            echo $argo_appname
+            argocd app set $argo_appname --kustomize-image $ECR_REGISTRY/$ECR_REPOSITORY=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+            sleep 5
+            # sleeping will reduce the odds that the next line will see the system as currently in sync and procede on to check 
+            # the version prematurely.            
+            argocd app wait --health ${argo_appname} --timeout 900 --operation
+            argo_app_status=`argocd app get ${argo_appname} --output json | jq -r '.status.operationState.phase'`
+            echo "ArgoCd app status for ${argo_appname} is ${argo_app_status}"
+            if [ "$argo_app_status" == "Succeeded" ]; then
+              echo "App Sync Succeeded!"
+            else
+              echo "App Sync $argo_app_status!"
+              echo "heck it out at: https://argocd.trustmineral.com/applications/${argo_appname}?view=tree&orphaned=false&resource="
+              exit 1
+            fi
+            version_check_url=`argocd app get ${argo_appname}  --output json  | jq -r '.metadata.annotations.version_check'`
+            version=`curl -s $version_check_url | jq -r '.version'`
+            if [ "$version" == "$TAG_NAME" ]; then
+              echo "App Version Update Successfully"
+            else
+              echo "App Version Update is not in yet, depending on your config this could be an issue or its waiting for you to sync. "
+              echo "Review Here: https://argocd.trustmineral.com/applications/${argo_appname}?view=tree&orphaned=false&resource="
+              if [ "$env" == "prod" ]; then
+                echo "when deploying to prod, autosync is disabled, that is why this step skipping, exiting 0"
+                echo "For the Release sync here: https://argocd.trustmineral.com/applications/${argo_appname}?view=tree&orphaned=false&resource="
+                exit 0
+              else
+                exit 1
+              fi
+            fi
+          done
